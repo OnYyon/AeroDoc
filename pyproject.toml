@@ -1,0 +1,17 @@
+[project]
+name = "aerodoc"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff", "mypy"]
+
+[tool.mypy]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+ignore_missing_imports = true
+strict = false
+check_untyped_defs = true
