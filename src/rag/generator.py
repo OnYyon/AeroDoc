@@ -1,7 +1,7 @@
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
 
-from src.rag.config import *
+from src.rag.config import LLM_MODEL, TEMPERATURE
 
 PROMPT_TEMPLATE = """\
 You are a Python programming expert. Answer the question based on the provided context. \

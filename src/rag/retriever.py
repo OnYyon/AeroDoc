@@ -2,7 +2,7 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 from typing import List, Tuple, Dict
 
-from src.rag.config import *
+from src.rag.config import EMBEDDING_MODEL, CHROMA_PATH, COLLECTION_NAME
 
 def retrieve_context(
     query: str,

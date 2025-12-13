@@ -4,7 +4,7 @@ import chromadb
 from typing import List, Dict
 import markitdown
 
-from src.rag.config import *
+from src.rag.config import CHROMA_PATH, CHUNK_SIZE, CHUNK_OVERLAP, COLLECTION_NAME, EMBEDDING_MODEL
 
 
 def load_pdf_content(pdf_path: str) -> str:
