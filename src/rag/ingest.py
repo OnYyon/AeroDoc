@@ -7,19 +7,21 @@ import markitdown
 import hashlib
 from datetime import datetime
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from src.rag.config import CHROMA_PATH, CHUNK_SIZE, CHUNK_OVERLAP, COLLECTION_NAME, EMBEDDING_MODEL, DOCUMENTS_DIR, SUPPORTED_FORMATS
+from src.rag.config import (
+    CHROMA_PATH, CHUNK_SIZE, CHUNK_OVERLAP, COLLECTION_NAME, 
+    EMBEDDING_MODEL, DOCUMENTS_DIR, SUPPORTED_FORMATS, 
+    MAX_WORKERS, EMBEDDING_BATCH_SIZE, RETRY_ATTEMPTS
+)
 from src.rag.logger import logger
 from src.rag.models import Document, DocumentMetadata, DocumentChunk
+from src.rag.utils import retry_on_exception, batch_list, Timer, compute_file_hash
 
 
 def get_file_checksum(file_path: str) -> str:
     """Вычисляет контрольную сумму файла."""
-    hash_md5 = hashlib.md5()
-    with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
+    return compute_file_hash(file_path, algorithm="md5")
 
 
 def load_document_content(file_path: str) -> str:
@@ -59,7 +61,7 @@ def split_document(content: str, source: str, document_id: str) -> List[Document
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""]
+        separators=["\n\n", "\n"]  # Упрощенные сепараторы для скорости
     )
     chunks = splitter.split_text(content)
     
@@ -138,17 +140,17 @@ def ingest_document(file_path: str) -> Optional[Document]:
 
 
 def get_document_hash_from_db(source: str) -> Optional[str]:
-    """Получает хеш документа из БД по источнику (получает все и выбирает первый)."""
+    """Получает хеш документа из БД по источнику."""
     try:
         client = chromadb.PersistentClient(path=str(CHROMA_PATH))
         collection = client.get_collection(name=COLLECTION_NAME)
-        
+
         # Ищем все чанки этого документа
         results = collection.get(
             where={"source": source},
             limit=1  # Нужен только один для получения хеша
         )
-        
+
         if results and results["metadatas"] and len(results["metadatas"]) > 0:
             file_hash = results["metadatas"][0].get("file_hash")
             if file_hash:
@@ -161,150 +163,155 @@ def get_document_hash_from_db(source: str) -> Optional[str]:
         return None
 
 
-def delete_document_from_db(source: str):
-    """Удаляет все чанки документа из БД по источнику."""
+def should_process_file(file_path: str, force_update: bool = False) -> bool:
+    """Проверяет, нужно ли обрабатывать файл по хешу."""
     try:
-        client = chromadb.PersistentClient(path=str(CHROMA_PATH))
-        collection = client.get_collection(name=COLLECTION_NAME)
-        
-        # Ищем все чанки этого документа
-        results = collection.get(
-            where={"source": source}
-        )
-        
-        if results and results["ids"]:
-            collection.delete(ids=results["ids"])
-            logger.info(f"Удалено {len(results['ids'])} чанков для источника: {source}")
+        file_name = Path(file_path).name
+        current_hash = get_file_checksum(file_path)
+        db_hash = get_document_hash_from_db(file_path)
+
+        if db_hash is None:
+            logger.info(f"Новый файл: {file_name}")
+            return True
+
+        if force_update:
+            logger.info(f"Принудительное обновление: {file_name}")
+            return True
+
+        if db_hash == current_hash:
+            logger.info(f"Пропуск (уже в БД): {file_name}")
+            return False
+
+        logger.info(f"Обновление (изменен): {file_name}")
+        return True
+
     except Exception as e:
-        logger.debug(f"Не удалось удалить документ: {str(e)}")
+        logger.warning(f"Ошибка проверки {Path(file_path).name}: {str(e)}")
+        return True
 
 
-def ingest_documents_to_db(documents: List[Document], force_update: bool = False):
-    """Сохраняет документы в Chroma DB (проверка хешей уже сделана в ingest_from_directory)."""
+def ingest_documents_to_db(documents: List[Document]):
+    """Сохраняет документы в Chroma DB с параллельной векторизацией."""
     if not documents:
-        logger.warning("Список документов пуст")
         return
-    
+
     try:
-        model = SentenceTransformer(EMBEDDING_MODEL)
-        client = chromadb.PersistentClient(path=str(CHROMA_PATH))
-        collection = client.get_or_create_collection(name=COLLECTION_NAME)
-        
-        total_chunks = 0
-        
-        for document in documents:
-            # Загружаем чанки и добавляем в БД
-            chunk_contents = [chunk.content for chunk in document.chunks]
-            logger.info(f"Векторизация {len(chunk_contents)} чанков для {Path(document.metadata.source).name}...")
-            embeddings = model.encode(chunk_contents)
-            
-            for chunk, embedding in zip(document.chunks, embeddings):
-                metadata = {
-                    "source": document.metadata.source,
-                    "title": document.metadata.title,
-                    "file_type": document.metadata.file_type,
-                    "file_hash": document.metadata.checksum,
-                    "chunk_index": chunk.metadata.get("chunk_index", 0)
-                }
+        with Timer("Сохранение документов в БД", log_level="info"):
+            model = SentenceTransformer(EMBEDDING_MODEL)
+            client = chromadb.PersistentClient(path=str(CHROMA_PATH))
+            collection = client.get_or_create_collection(name=COLLECTION_NAME)
+
+            total_chunks = 0
+
+            for document in documents:
+                chunk_contents = [chunk.content for chunk in document.chunks]
                 
-                collection.add(
-                    documents=[chunk.content],
-                    embeddings=[embedding.tolist()],
-                    metadatas=[metadata],
-                    ids=[chunk.id]
+                if not chunk_contents:
+                    logger.warning(f"Нет чанков для {Path(document.metadata.source).name}")
+                    continue
+                
+                logger.info(
+                    f"Векторизация {len(chunk_contents)} чанков "
+                    f"для {Path(document.metadata.source).name}..."
                 )
-                total_chunks += 1
-        
-        logger.info(f"✅ Успешно загружено {total_chunks} чанков в коллекцию '{COLLECTION_NAME}'")
-    
+                
+                # Обработка батчами для больших документов
+                embeddings = []
+                for batch in batch_list(chunk_contents, EMBEDDING_BATCH_SIZE):
+                    batch_embeddings = model.encode(batch, show_progress_bar=False)
+                    embeddings.extend(batch_embeddings)
+
+                # Сохранение в батчах
+                batch_size = 100
+                for i in range(0, len(document.chunks), batch_size):
+                    batch_chunks = document.chunks[i:i + batch_size]
+                    batch_embeddings = embeddings[i:i + batch_size]
+                    
+                    for chunk, embedding in zip(batch_chunks, batch_embeddings):
+                        metadata = {
+                            "source": document.metadata.source,
+                            "title": document.metadata.title,
+                            "file_type": document.metadata.file_type,
+                            "file_hash": document.metadata.checksum,
+                            "chunk_index": chunk.metadata.get("chunk_index", 0)
+                        }
+
+                        collection.add(
+                            documents=[chunk.content],
+                            embeddings=[embedding.tolist()],
+                            metadatas=[metadata],
+                            ids=[chunk.id]
+                        )
+                        total_chunks += 1
+
+            logger.info(f"Загружено {total_chunks} чанков в БД")
+
     except Exception as e:
-        logger.error(f"Ошибка при сохранении документов в БД: {str(e)}")
-        raise
+        logger.error(f"Ошибка при сохранении: {str(e)}")
 
 
+@retry_on_exception(max_attempts=RETRY_ATTEMPTS, delay=1.0, backoff=1.5)
 def ingest_from_directory(directory: Optional[Path] = None, force_update: bool = False) -> List[Document]:
     """Загружает все поддерживаемые документы из директории (с проверкой по хешам)."""
     if directory is None:
         directory = DOCUMENTS_DIR
-    
+
     directory = Path(directory)
-    
+
     if not directory.exists():
         logger.error(f"Директория не найдена: {directory}")
         return []
-    
+
     logger.info(f"Сканирование директории: {directory}")
-    
-    # Проверяем наличие коллекции
-    collection_exists = False
+
     try:
         client = chromadb.PersistentClient(path=str(CHROMA_PATH))
         collection = client.get_collection(name=COLLECTION_NAME)
-        logger.info(f"Коллекция найдена: {collection.count()} чанков в БД")
-        collection_exists = True
-    except Exception as e:
-        logger.info(f"Коллекция не найдена, будет создана при загрузке документов")
-        collection_exists = False
-    
-    documents_to_process = []
-    skipped_files = 0
-    
-    # ПЕРВЫЙ ПРОХОД: фильтруем файлы по хешам БЕЗ загрузки
+        logger.info(f"Найдено {collection.count()} чанков в БД")
+    except Exception:
+        logger.info("БД пуста, начинаю первую загрузку")
+
+    # Собираем файлы для обработки
+    files_to_process = []
+    skipped_count = 0
+
     for file_format in SUPPORTED_FORMATS:
         for file_path in directory.glob(f"*{file_format}"):
-            try:
-                file_name = file_path.name
-                file_path_str = str(file_path)
-                
-                # Вычисляем хеш текущего файла
-                current_hash = get_file_checksum(file_path_str)
-                
-                # Получаем хеш из БД если коллекция существует
-                if collection_exists:
-                    db_hash = get_document_hash_from_db(file_path_str)
-                else:
-                    db_hash = None
-                
-                # Проверяем логику
-                if db_hash is not None:
-                    # Файл есть в БД
-                    if db_hash == current_hash and not force_update:
-                        # Файл не изменился - пропускаем
-                        logger.info(f"⏭️  Пропуск (уже в БД): {file_name} [хеш совпадает]")
-                        skipped_files += 1
-                        continue
-                    else:
-                        # Файл изменился - обновляем
-                        logger.info(f"🔄 Обновление (хеш изменился): {file_name}")
-                        delete_document_from_db(file_path_str)
-                else:
-                    # Файла нет в БД - это новый файл
-                    logger.info(f"➕ Новый файл: {file_name}")
-                
-                # Добавляем в список на обработку
-                documents_to_process.append(file_path_str)
-                
-            except Exception as e:
-                logger.error(f"Ошибка при проверке хеша {file_path.name}: {str(e)}")
-                continue
-    
-    logger.info(f"Результаты сканирования: пропущено {skipped_files} файлов, к обработке {len(documents_to_process)}")
-    
-    # ВТОРОЙ ПРОХОД: загружаем и обрабатываем только нужные файлы
+            file_path_str = str(file_path)
+            if should_process_file(file_path_str, force_update):
+                files_to_process.append(file_path_str)
+            else:
+                skipped_count += 1
+
+    logger.info(f"К обработке: {len(files_to_process)}, пропущено: {skipped_count}")
+
+    # Параллельная обработка файлов
     documents = []
-    for file_path_str in documents_to_process:
-        logger.info(f"Обработка файла: {Path(file_path_str).name}")
-        document = ingest_document(file_path_str)
-        if document:
-            documents.append(document)
-    
+    if files_to_process:
+        logger.info(f"Запуск параллельной обработки ({MAX_WORKERS} worker'ов)...")
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(ingest_document, file_path): file_path 
+                for file_path in files_to_process
+            }
+            
+            for future in as_completed(futures):
+                try:
+                    document = future.result()
+                    if document:
+                        documents.append(document)
+                except Exception as e:
+                    file_path = futures[future]
+                    logger.error(f"Ошибка при обработке {Path(file_path).name}: {str(e)}")
+
     if documents:
-        logger.info(f"Загружено {len(documents)} документов, начинаю инжестию в БД...")
-        ingest_documents_to_db(documents, force_update=False)
+        logger.info(f"Загрузка {len(documents)} документов в БД...")
+        ingest_documents_to_db(documents)
     else:
-        if skipped_files > 0:
-            logger.info(f"✅ Все {skipped_files} документов уже в БД с актуальными хешами")
+        if skipped_count > 0:
+            logger.info("Все документы актуальны")
         else:
-            logger.warning(f"Документы не найдены в {directory}")
-    
+            logger.warning("Документы не найдены")
+
     return documents
