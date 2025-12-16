@@ -7,7 +7,7 @@ on:
     branches: ["stage"]
 
 jobs:
-  ci:
+  lint:
     runs-on: ubuntu-latest
 
     steps:
